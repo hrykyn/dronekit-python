@@ -61,8 +61,9 @@ class APIException(Exception):
     :param String message: Message string describing the exception
     """
 
-    def __init__(self, message):
-        super(APIException, self).__init__(message)
+
+class TimeoutError(APIException):
+    '''Raised by operations that have timeouts.'''
 
 
 class Attitude(object):
@@ -730,7 +731,7 @@ class ChannelsOverride(dict):
 
     def __setitem__(self, key, value):
         if not (int(key) > 0 and int(key) <= self._count):
-            raise Exception('Invalid channel index %s' % key)
+            raise KeyError('Invalid channel index %s' % key)
         if not value:
             try:
                 dict.__delitem__(self, str(key))
@@ -1110,7 +1111,7 @@ class Vehicle(HasObservers):
                 # ArduPilot <3.4 fails to send capabilities correctly
                 # straight after boot, and even older versions send
                 # this back as always-0.
-                vehicle.remove_message_listener('HEARTBEAT', self.send_capabilties_request)
+                vehicle.remove_message_listener('HEARTBEAT', self.send_capabilities_request)
             self.notify_attribute_listeners('autopilot_version', self._raw_version)
 
         # gimbal
@@ -1189,12 +1190,15 @@ class Vehicle(HasObservers):
 
         @self.on_message('HEARTBEAT')
         def listener(self, name, m):
+            # ignore groundstations
+            if m.type == mavutil.mavlink.MAV_TYPE_GCS:
+                return
             self._armed = (m.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
             self.notify_attribute_listeners('armed', self.armed, cache=True)
             self._autopilot_type = m.autopilot
             self._vehicle_type = m.type
             if self._is_mode_available(m.custom_mode, m.base_mode) == False:
-                raise APIException("mode %s not available on mavlink definition" % m.custom_mode)
+                raise APIException("mode (%s, %s) not available on mavlink definition" % (m.custom_mode, m.base_mode))
             if self._autopilot_type == mavutil.mavlink.MAV_AUTOPILOT_PX4:
                 self._flightmode = mavutil.interpret_px4_mode(m.base_mode, m.custom_mode)
             else:
@@ -1352,6 +1356,9 @@ class Vehicle(HasObservers):
 
         @self.on_message(['HEARTBEAT'])
         def listener(self, name, msg):
+            # ignore groundstations
+            if msg.type == mavutil.mavlink.MAV_TYPE_GCS:
+                return
             self._heartbeat_system = msg.get_srcSystem()
             self._heartbeat_lastreceived = monotonic.monotonic()
             if self._heartbeat_timeout:
@@ -1561,7 +1568,26 @@ class Vehicle(HasObservers):
     @property
     def mode(self):
         """
-        This attribute is used to get and set the current flight mode (:py:class:`VehicleMode`).
+        This attribute is used to get and set the current flight mode. You
+        can specify the value as a :py:class:`VehicleMode`, like this:
+
+        .. code-block:: python
+
+           vehicle.mode = VehicleMode('LOITER')
+
+        Or as a simple string:
+
+        .. code-block:: python
+
+            vehicle.mode = 'LOITER'
+
+        If you are targeting ArduPilot you can also specify the flight mode
+        using a numeric value (this will not work with PX4 autopilots):
+
+        .. code-block:: python
+
+            # set mode to LOITER
+            vehicle.mode = 5
         """
         if not self._flightmode:
             return None
@@ -1569,8 +1595,13 @@ class Vehicle(HasObservers):
 
     @mode.setter
     def mode(self, v):
+        if isinstance(v, basestring):
+            v = VehicleMode(v)
+
         if self._autopilot_type == mavutil.mavlink.MAV_AUTOPILOT_PX4:
             self._master.set_mode(v.name)
+        elif isinstance(v, int):
+            self._master.set_mode(v)
         else:
             self._master.set_mode(self._mode_mapping[v.name])
 
@@ -1927,7 +1958,7 @@ class Vehicle(HasObservers):
         """
 
         if not isinstance(pos, LocationGlobal):
-            raise Exception('Excepting home_location to be set to a LocationGlobal.')
+            raise ValueError('Expecting home_location to be set to a LocationGlobal.')
 
         # Set cached home location.
         self._home_location = copy.copy(pos)
@@ -1959,6 +1990,119 @@ class Vehicle(HasObservers):
         """
         return self._parameters
 
+    def wait_for(self, condition, timeout=None, interval=0.1, errmsg=None):
+        '''Wait for a condition to be True.
+
+        Wait for condition, a callable, to return True.  If timeout is
+        nonzero, raise a TimeoutError(errmsg) if the condition is not
+        True after timeout seconds.  Check the condition everal
+        interval seconds.
+        '''
+
+        t0 = time.time()
+        while not condition():
+            t1 = time.time()
+            if timeout and (t1 - t0) >= timeout:
+                raise TimeoutError(errmsg)
+
+            time.sleep(interval)
+
+    def wait_for_armable(self, timeout=None):
+        '''Wait for the vehicle to become armable.
+
+        If timeout is nonzero, raise a TimeoutError if the vehicle
+        is not armable after timeout seconds.
+        '''
+
+        def check_armable():
+            return self.is_armable
+
+        self.wait_for(check_armable, timeout=timeout)
+
+    def arm(self, wait=True, timeout=None):
+        '''Arm the vehicle.
+
+        If wait is True, wait for arm operation to complete before
+        returning.  If timeout is nonzero, raise a TimeouTerror if the
+        vehicle has not armed after timeout seconds.
+        '''
+
+        self.armed = True
+
+        if wait:
+            self.wait_for(lambda: self.armed, timeout=timeout,
+                          errmsg='failed to arm vehicle')
+
+    def disarm(self, wait=True, timeout=None):
+        '''Disarm the vehicle.
+
+        If wait is True, wait for disarm operation to complete before
+        returning.  If timeout is nonzero, raise a TimeouTerror if the
+        vehicle has not disarmed after timeout seconds.
+        '''
+        self.armed = False
+
+        if wait:
+            self.wait_for(lambda: not self.armed, timeout=timeout,
+                          errmsg='failed to disarm vehicle')
+
+    def wait_for_mode(self, mode, timeout=None):
+        '''Set the flight mode.
+
+        If wait is True, wait for the mode to change before returning.
+        If timeout is nonzero, raise a TimeoutError if the flight mode
+        hasn't changed after timeout seconds.
+        '''
+
+        if not isinstance(mode, VehicleMode):
+            mode = VehicleMode(mode)
+
+        self.mode = mode
+
+        self.wait_for(lambda: self.mode.name == mode.name,
+                      timeout=timeout,
+                      errmsg='failed to set flight mode')
+
+    def wait_for_alt(self, alt, epsilon=0.1, rel=True, timeout=None):
+        '''Wait for the vehicle to reach the specified altitude.
+
+        Wait for the vehicle to get within epsilon meters of the
+        given altitude.  If rel is True (the default), use the
+        global_relative_frame. If rel is False, use the global_frame.
+        If timeout is nonzero, raise a TimeoutError if the specified
+        altitude has not been reached after timeout seconds.
+        '''
+
+        def get_alt():
+            if rel:
+                alt = self.location.global_relative_frame.alt
+            else:
+                alt = self.location.global_frame.alt
+
+            return alt
+
+        def check_alt():
+            cur = get_alt()
+            delta = abs(alt-cur)
+
+            return (
+                (delta < epsilon) or
+                (start < alt and cur > alt) or
+                (start > alt and cur < alt)
+            )
+
+        start = get_alt()
+
+        self.wait_for(
+            check_alt,
+            timeout=timeout,
+            errmsg='failed to reach specified altitude')
+
+    def wait_simple_takeoff(self, alt=None, epsilon=0.1, timeout=None):
+        self.simple_takeoff(alt)
+
+        if alt is not None:
+            self.wait_for_alt(alt, epsilon=epsilon, timeout=timeout)
 
     def simple_takeoff(self, alt=None):
         """
@@ -1983,7 +2127,7 @@ class Vehicle(HasObservers):
         """
         if alt is not None:
             altitude = float(alt)
-            if math.isnan(alt) or math.isinf(alt):
+            if math.isnan(altitude) or math.isinf(altitude):
                 raise ValueError("Altitude was NaN or Infinity. Please provide a real number")
             self._master.mav.command_long_send(0, 0, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
                                                   0, 0, 0, 0, 0, 0, 0, altitude)
@@ -2028,7 +2172,7 @@ class Vehicle(HasObservers):
                 self.commands.wait_ready()
             alt = location.alt - self.home_location.alt
         else:
-            raise APIException('Expecting location to be LocationGlobal or LocationGlobalRelative.')
+            raise ValueError('Expecting location to be LocationGlobal or LocationGlobalRelative.')
 
         self._master.mav.mission_item_send(0, 0, 0, frame,
                                            mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 2, 0, 0,
@@ -2130,7 +2274,7 @@ class Vehicle(HasObservers):
             self._master.mav.request_data_stream_send(0, 0, mavutil.mavlink.MAV_DATA_STREAM_ALL,
                                                       rate, 1)
 
-        self.add_message_listener('HEARTBEAT', self.send_capabilties_request)
+        self.add_message_listener('HEARTBEAT', self.send_capabilities_request)
 
         # Ensure initial parameter download has started.
         while True:
@@ -2142,6 +2286,14 @@ class Vehicle(HasObservers):
                 break
 
     def send_capabilties_request(self, vehicle, name, m):
+        '''An alias for send_capabilities_request.
+
+        The word "capabilities" was misspelled in previous versions of this code. This is simply
+        an alias to send_capabilities_request using the legacy name.
+        '''
+        return self.send_capabilities_request(vehicle, name, m)
+
+    def send_capabilities_request(self, vehicle, name, m):
         '''Request an AUTOPILOT_VERSION packet'''
         capability_msg = vehicle.message_factory.command_long_encode(0, 0, mavutil.mavlink.MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES, 0, 1, 0, 0, 0, 0, 0, 0)
         vehicle.send_mavlink(capability_msg)
@@ -2191,7 +2343,7 @@ class Vehicle(HasObservers):
             types = self._default_ready_attrs
 
         if not all(isinstance(item, basestring) for item in types):
-            raise APIException('wait_ready expects one or more string arguments.')
+            raise ValueError('wait_ready expects one or more string arguments.')
 
         # Wait for these attributes to have been set.
         await = set(types)
@@ -2200,7 +2352,7 @@ class Vehicle(HasObservers):
             time.sleep(0.1)
             if monotonic.monotonic() - start > timeout:
                 if raise_exception:
-                    raise APIException('wait_ready experienced a timeout after %s seconds.' %
+                    raise TimeoutError('wait_ready experienced a timeout after %s seconds.' %
                                        timeout)
                 else:
                     return False
@@ -2349,7 +2501,7 @@ class Gimbal(object):
                 self.commands.wait_ready()
             alt = roi.alt - self.home_location.alt
         else:
-            raise APIException('Expecting location to be LocationGlobal or LocationGlobalRelative.')
+            raise ValueError('Expecting location to be LocationGlobal or LocationGlobalRelative.')
 
         #set the ROI
         msg = self._vehicle.message_factory.command_long_encode(
