@@ -81,7 +81,7 @@ def on_close(ws):
 vehicle = connect('udp:127.0.0.1:14550', wait_ready=True)
 
 websocket.enableTrace(True)
-ws = websocket.WebSocketApp("ws://184.72.178.158:3000/ws",
+ws = websocket.WebSocketApp("ws://{ip address}:3000/ws",
                           on_message = on_message,
                           on_error = on_error,
                           on_close = on_close)
